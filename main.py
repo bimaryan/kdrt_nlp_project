@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import joblib
+import pandas as pd
 import os
 
 # ==========================================
@@ -13,28 +14,52 @@ app = FastAPI(
 )
 
 # ==========================================
-# SETUP PATH & LOAD MODEL AI (.pkl)
+# SETUP PATH & LOAD MODEL AI (.pkl) & DATASET
 # ==========================================
-# Pastiin nama file di folder "models" udah sesuai sama ini ya bray!
 MODEL_PATH = os.path.join("models", "random_forest_model2.pkl")
 ENCODER_PATH = os.path.join("models", "label_encoder2.pkl")
+DATASET_PATH = os.path.join("data", "raw", "dataset.csv")
 
 rf_model = None
 label_encoder = None
 pesan_error_asli = ""
+TANGGAPAN_KDRT = {}
 
 try:
-    # Load model hasil dari Google Colab pakai joblib
+    # 1. Load model hasil dari Google Colab pakai joblib
     rf_model = joblib.load(MODEL_PATH)
     label_encoder = joblib.load(ENCODER_PATH)
-        
     print("✅ MANTAP BRAY! Model Pipeline & Label Encoder sukses di-load!")
+    
+    # 2. Load Tanggapan dari Dataset CSV
+    # Asumsi pemisah kolomnya koma (,). Kalau error coba ganti sep=';'
+    df = pd.read_csv(DATASET_PATH)
+    
+    # GANTI NAMA KOLOM DI BAWAH INI KALAU BEDA SAMA YANG DI CSV LU YA BRAY
+    kolom_kategori = 'Label' 
+    kolom_tanggapan = 'Tanggapan'
+    
+    # Buang data duplikat biar kita dapet mapping unik dari Kategori -> Tanggapan
+    df_mapping = df.dropna(subset=[kolom_kategori, kolom_tanggapan]).drop_duplicates(subset=[kolom_kategori])
+    TANGGAPAN_KDRT = dict(zip(df_mapping[kolom_kategori], df_mapping[kolom_tanggapan]))
+    
+    print("✅ MANTAP BRAY! Rekomendasi sistem sukses di-load dari dataset.csv!")
+    
 except Exception as e:
     pesan_error_asli = str(e)
-    print(f"⚠️ Gagal nge-load model! Error aslinya: {e}")
+    print(f"⚠️ Gagal nge-load file (Model atau Dataset)! Error aslinya: {e}")
+    # Fallback kalau CSV gagal ke-baca (jaga-jaga aja)
+    TANGGAPAN_KDRT = {
+        "K5": "🚨 DARURAT: Nyawa terancam. Segera hubungi Polisi (110) atau hotline darurat (112) dan amankan diri Anda.",
+        "K4": "Segera hubungi atau datangi kantor DP3A Kabupaten Indramayu untuk perlindungan fisik.",
+        "K3": "Segera hubungi DP3A untuk pendampingan psikologis dan perlindungan.",
+        "K2": "Segera hubungi DP3A untuk pendampingan.",
+        "K1": "Disarankan untuk melakukan konseling mediasi keluarga/pernikahan melalui layanan DP3A.",
+        "NON_KDRT": "Diarahkan ke layanan konseling umum atau pendampingan psikolog untuk pemulihan kesehatan mental."
+    }
 
 # ==========================================
-# KAMUS KATEGORI KDRT
+# KAMUS KATEGORI KDRT (Buat deskripsi)
 # ==========================================
 KATEGORI_KDRT = {
     "NON_KDRT": "Bukan KDRT (Perasaan sedih, stres, depresi tanpa unsur kekerasan)",
@@ -116,20 +141,12 @@ def proses_klasifikasi(request: ChatRequest):
                     kode_kategori = str(hasil_prediksi_mentah)
 
         # ==================================================
-        # 5. HASIL & REKOMENDASI SOP
+        # 5. HASIL & REKOMENDASI SOP (Narik dari CSV)
         # ==================================================
         hasil_deskripsi = KATEGORI_KDRT.get(kode_kategori, "Kategori Tidak Dikenali")
 
-        if kode_kategori == "K5":
-            rekomendasi = "🚨 DARURAT: Nyawa terancam. Segera hubungi Polisi (110) atau hotline darurat (112) dan amankan diri Anda."
-        elif kode_kategori in ["K2", "K3", "K4"]:
-            rekomendasi = "Segera hubungi atau datangi kantor DP3A Kabupaten Indramayu untuk perlindungan dan pendampingan hukum/psikologis."
-        elif kode_kategori == "K1":
-            rekomendasi = "Disarankan untuk melakukan konseling mediasi keluarga/pernikahan melalui layanan DP3A."
-        elif kode_kategori == "NON_KDRT":
-            rekomendasi = "Diarahkan ke layanan konseling umum atau pendampingan psikolog untuk pemulihan kesehatan mental."
-        else:
-            rekomendasi = "Sistem telah menerima pesan Anda."
+        # Ini kuncinya bray! Narik balasan dari dictionary yang udah ngebaca dataset
+        rekomendasi = TANGGAPAN_KDRT.get(kode_kategori, "Sistem telah menerima pesan Anda. Kami akan segera merespon.")
 
         return {
             "teks_laporan": teks_masuk,
