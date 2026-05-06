@@ -3,15 +3,26 @@ from pydantic import BaseModel
 import joblib
 import pandas as pd
 import os
-import re  # TAMBAHAN: Dibutuhkan untuk fungsi clean_text
+import re
+from groq import Groq
+from dotenv import load_dotenv
 
 # ==========================================
-# INISIALISASI APP
+# INISIALISASI ENVIRONMENT & API KEY GROQ
 # ==========================================
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+groq_client = None
+if not GROQ_API_KEY:
+    print("⚠️ WARNING: GROQ_API_KEY tidak ditemukan di environment Docker!")
+else:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+
 app = FastAPI(
     title="SafeTalk AI Backend",
-    description="API Konsultasi Berbasis NLP untuk Klasifikasi Teks Laporan KDRT (DP3A Kab. Indramayu)",
-    version="1.0.0"
+    description="API Konsultasi Berbasis NLP untuk Klasifikasi Teks Laporan KDRT (DP3A Kab. Indramayu) dengan integrasi Groq LLM",
+    version="2.1.0"
 )
 
 # ==========================================
@@ -27,60 +38,43 @@ pesan_error_asli = ""
 TANGGAPAN_KDRT = {}
 
 try:
-    # 1. Load model hasil dari Google Colab pakai joblib
     rf_model = joblib.load(MODEL_PATH)
     label_encoder = joblib.load(ENCODER_PATH)
-    print("✅ MANTAP BRAY! Model Pipeline & Label Encoder sukses di-load!")
+    print("✅ MANTAP! Model & Label Encoder sukses di-load!")
     
-    # 2. Load Tanggapan dari Dataset CSV
-    # Asumsi pemisah kolomnya koma (,). Kalau error coba ganti sep=';'
     df = pd.read_csv(DATASET_PATH)
-    
-    # GANTI NAMA KOLOM DI BAWAH INI KALAU BEDA SAMA YANG DI CSV LU YA BRAY
     kolom_kategori = 'Label' 
     kolom_tanggapan = 'Tanggapan'
     
-    # Validasi jika kolom tersedia di dataset
     if kolom_kategori in df.columns and kolom_tanggapan in df.columns:
-        # Buang data duplikat biar kita dapet mapping unik dari Kategori -> Tanggapan
         df_mapping = df.dropna(subset=[kolom_kategori, kolom_tanggapan]).drop_duplicates(subset=[kolom_kategori])
         TANGGAPAN_KDRT = dict(zip(df_mapping[kolom_kategori], df_mapping[kolom_tanggapan]))
-        print("✅ MANTAP BRAY! Rekomendasi sistem sukses di-load dari dataset.csv!")
     else:
-        print("⚠️ Kolom kategori/tanggapan tidak ditemukan, pakai fallback!")
         raise Exception("Struktur kolom CSV tidak cocok.")
     
 except Exception as e:
     pesan_error_asli = str(e)
-    print(f"⚠️ Gagal nge-load file (Model atau Dataset)! Error aslinya: {e}")
-    # Fallback kalau CSV gagal ke-baca (jaga-jaga aja)
+    print(f"⚠️ Gagal load file: {e}")
     TANGGAPAN_KDRT = {
-        "K5": "🚨 DARURAT: Nyawa terancam. Segera hubungi Polisi (110) atau hotline darurat (112) dan amankan diri Anda.",
-        "K4": "Segera hubungi atau datangi kantor DP3A Kabupaten Indramayu untuk perlindungan fisik.",
-        "K3": "Segera hubungi DP3A untuk pendampingan psikologis dan perlindungan.",
-        "K2": "Segera hubungi DP3A untuk pendampingan.",
-        "K1": "Disarankan untuk melakukan konseling mediasi keluarga/pernikahan melalui layanan DP3A.",
-        "NON_KDRT": "Diarahkan ke layanan konseling umum atau pendampingan psikolog untuk pemulihan kesehatan mental."
+        "K5": "🚨 DARURAT: Nyawa terancam. Segera hubungi Polisi (110) atau hotline darurat (112) dan amankan diri Anda."
     }
 
-# ==========================================
-# KAMUS KATEGORI KDRT (Buat deskripsi)
-# ==========================================
 KATEGORI_KDRT = {
-    "NON_KDRT": "Bukan KDRT (Perasaan sedih, stres, depresi tanpa unsur kekerasan)",
-    "K1": "Keluhan Ringan (Terkait relasi rumah tangga, belum jelas ada kekerasan)",
-    "K2": "Kekerasan Verbal / Emosional (Dibentak, dihina, direndahkan, dimaki)",
-    "K3": "Tekanan Psikologis / Kontrol (Intimidasi, ancaman, pengurungan, larangan)",
-    "K4": "Kekerasan Fisik (Dipukul, ditampar, ditendang, didorong, dijambak)",
-    "K5": "Kekerasan Berat / Darurat (Dicekik, diancam dibunuh, pakai senjata, luka parah)"
+    "NON_KDRT": "Bukan KDRT",
+    "K1": "Keluhan Ringan",
+    "K2": "Kekerasan Verbal / Emosional",
+    "K3": "Tekanan Psikologis / Kontrol",
+    "K4": "Kekerasan Fisik",
+    "K5": "Kekerasan Berat / Darurat"
 }
 
 class ChatRequest(BaseModel):
     pesan_teks: str
 
 # ==========================================
-# FUNGSI PREPROCESSING (SINKRON DARI COLAB)
+# FUNGSI PREPROCESSING
 # ==========================================
+
 def clean_text(text):
     text = str(text).lower()
     text = re.sub(r"http\S+|www\S+|https\S+", " ", text)
@@ -103,26 +97,20 @@ def clean_text(text):
     return text
 
 # ==========================================
-# ENDPOINT / ROUTES
+# ENDPOINT
 # ==========================================
-
-@app.get("/", tags=["Status"])
+@app.get("/")
 def cek_status():
-    return {
-        "status": "Online", 
-        "project": "SafeTalk AI - DP3A Indramayu",
-        "message": "Server backend siap menerima laporan!"
-    }
+    return {"status": "Online"}
 
-@app.post("/klasifikasi-chat", tags=["AI Processing"])
+@app.post("/klasifikasi-chat")
 def proses_klasifikasi(request: ChatRequest):
     if rf_model is None or label_encoder is None:
-        raise HTTPException(status_code=500, detail=f"Gagal Load PKL bray! Error Asli: {pesan_error_asli}")
+        raise HTTPException(status_code=500, detail=f"Gagal Load PKL bray! Error: {pesan_error_asli}")
 
     teks_masuk = request.pesan_teks.strip()
-
     if not teks_masuk:
-        raise HTTPException(status_code=400, detail="Pesan teks nggak boleh kosong.")
+        raise HTTPException(status_code=400, detail="Pesan kosong.")
 
     # ==================================================
     # 1. FITUR BALASAN SAPAAN (GREETING)
@@ -132,58 +120,85 @@ def proses_klasifikasi(request: ChatRequest):
     if teks_masuk.lower() in kata_sapaan or len(teks_masuk.split()) < 3:
         return {
             "teks_laporan": teks_masuk,
+            "teks_dianalisis": teks_masuk,
             "kode_kategori": "SAPAAN",
             "hasil_klasifikasi": "Sapaan / Pesan Pendek",
-            "rekomendasi_sistem": "Halo! Selamat datang di SafeTalk AI DP3A Kabupaten Indramayu. Silakan ceritakan detail kejadian atau keluhan yang Anda alami, kami siap membantu dan melindungi Anda."
+            "rekomendasi_sistem_raw": "Halo! Selamat datang di SafeTalk AI DP3A Kabupaten Indramayu. Silakan ceritakan detail kejadian atau keluhan yang Anda alami.",
+            "tanggapan_llm": "Halo! Saya adalah asisten virtual SafeTalk AI dari DP3A Kabupaten Indramayu. Ada yang bisa saya bantu? Silakan ceritakan keluhan atau kejadian yang Anda alami dengan tenang. Kami siap mendengarkan dan membantu Anda."
         }
 
+    # ==================================================
+    # 2. PREPROCESSING NLP
+    # ==================================================
+    teks_bersih = clean_text(teks_masuk)
+    
     try:
-        # ==================================================
-        # 2. PREPROCESSING
-        # ==================================================
-        # Wajib di-clean dulu biar persis kayak data training di Colab
-        teks_bersih = clean_text(teks_masuk)
-
-        # ==================================================
-        # 3. PREDIKSI LANGSUNG DARI PIPELINE (KEMBAR DENGAN COLAB)
-        # ==================================================
-        # Catatan: rf_model ini sebenarnya adalah Pipeline (TF-IDF + Random Forest)
-        # Jadi kita tinggal masukkan teks string-nya saja, otomatis di-TF-IDF-kan oleh pipeline
-        
+        # 3. PREDIKSI
         probabilitas = rf_model.predict_proba([teks_bersih])[0]
         probabilitas_max = max(probabilitas)
-        
-        # Ambil prediksi mentah (angka)
         hasil_prediksi_mentah = rf_model.predict([teks_bersih])[0]
         
         try:
-            # Ubah angka kembali jadi label ("K5", "NON_KDRT", dll)
             kode_kategori = label_encoder.inverse_transform([hasil_prediksi_mentah])[0]
         except:
             kode_kategori = str(hasil_prediksi_mentah)
 
-        # ==================================================
-        # 4. HASIL & REKOMENDASI SOP (Narik dari CSV)
-        # ==================================================
-        hasil_deskripsi = KATEGORI_KDRT.get(kode_kategori, "Kategori Tidak Dikenali")
+        hasil_deskripsi = KATEGORI_KDRT.get(kode_kategori, "Tidak Dikenali")
+        rekomendasi_sop = TANGGAPAN_KDRT.get(kode_kategori, "Kami akan segera merespon.")
 
-        # Narik balasan dari dictionary dataset
-        rekomendasi = TANGGAPAN_KDRT.get(kode_kategori, "Sistem telah menerima pesan Anda. Kami akan segera merespon.")
+        # 4. LLM GENERATION MENGGUNAKAN GROQ
+        tanggapan_ai_final = rekomendasi_sop 
+        
+        if groq_client:
+            prompt_user = f"""
+            Anda adalah konselor virtual dari layanan SafeTalk AI milik DP3A Kabupaten Indramayu.
+            Tugas Anda adalah memberikan balasan yang sangat empatik, menenangkan, dan solutif kepada pelapor kasus KDRT.
+            
+            Informasi Laporan:
+            - Cerita Pelapor: "{teks_masuk}"
+            - Kategori Deteksi Sistem: {hasil_deskripsi}
+            - Arahan SOP DP3A Kabupaten Indramayu: "{rekomendasi_sop}"
+            
+            Instruksi:
+            1. Validasi perasaan korban dengan empati.
+            2. Masukkan arahan dari "Arahan SOP DP3A Kabupaten Indramayu" dengan bahasa halus.
+            3. JANGAN mengarang nomor telepon/kontak selain dari "Arahan SOP DP3A Kabupaten Indramayu".
+            4. Maksimal 1 paragraf singkat.
+            """
+            try:
+                # Memanggil API Groq dengan model Llama 3.1 8B
+                chat_completion = groq_client.chat.completions.create(
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "Anda adalah konselor virtual dari layanan SafeTalk AI milik DP3A Kabupaten Indramayu."
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt_user
+                        }
+                    ],
+                    model="llama-3.1-8b-instant", 
+                    temperature=0.4,
+                    max_tokens=512,
+                    top_p=0.9,
+                )
+                tanggapan_ai_final = chat_completion.choices[0].message.content.strip()
+            except Exception as e:
+                print(f"⚠️ Gagal generate LLM Groq: {e}")
 
         return {
             "teks_laporan": teks_masuk,  
             "teks_dianalisis": teks_bersih, 
             "kode_kategori": kode_kategori,
             "hasil_klasifikasi": hasil_deskripsi,
-            "rekomendasi_sistem": rekomendasi
+            "rekomendasi_sistem_raw": rekomendasi_sop, 
+            "tanggapan_llm": tanggapan_ai_final 
         }
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Otak AI lagi error pas ngeproses bray: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error AI: {str(e)}")
 
-# ==========================================
-# RUN SERVER LOKAL
-# ==========================================
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8111, reload=True)
