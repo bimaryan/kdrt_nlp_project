@@ -3,6 +3,7 @@ from pydantic import BaseModel
 import joblib
 import pandas as pd
 import os
+import re  # TAMBAHAN: Dibutuhkan untuk fungsi clean_text
 
 # ==========================================
 # INISIALISASI APP
@@ -16,8 +17,8 @@ app = FastAPI(
 # ==========================================
 # SETUP PATH & LOAD MODEL AI (.pkl) & DATASET
 # ==========================================
-MODEL_PATH = os.path.join("models", "random_forest_model2.pkl")
-ENCODER_PATH = os.path.join("models", "label_encoder2.pkl")
+MODEL_PATH = os.path.join("models", "random_forest_model.pkl")
+ENCODER_PATH = os.path.join("models", "label_encoder.pkl")
 DATASET_PATH = os.path.join("data", "raw", "dataset.csv")
 
 rf_model = None
@@ -39,11 +40,15 @@ try:
     kolom_kategori = 'Label' 
     kolom_tanggapan = 'Tanggapan'
     
-    # Buang data duplikat biar kita dapet mapping unik dari Kategori -> Tanggapan
-    df_mapping = df.dropna(subset=[kolom_kategori, kolom_tanggapan]).drop_duplicates(subset=[kolom_kategori])
-    TANGGAPAN_KDRT = dict(zip(df_mapping[kolom_kategori], df_mapping[kolom_tanggapan]))
-    
-    print("✅ MANTAP BRAY! Rekomendasi sistem sukses di-load dari dataset.csv!")
+    # Validasi jika kolom tersedia di dataset
+    if kolom_kategori in df.columns and kolom_tanggapan in df.columns:
+        # Buang data duplikat biar kita dapet mapping unik dari Kategori -> Tanggapan
+        df_mapping = df.dropna(subset=[kolom_kategori, kolom_tanggapan]).drop_duplicates(subset=[kolom_kategori])
+        TANGGAPAN_KDRT = dict(zip(df_mapping[kolom_kategori], df_mapping[kolom_tanggapan]))
+        print("✅ MANTAP BRAY! Rekomendasi sistem sukses di-load dari dataset.csv!")
+    else:
+        print("⚠️ Kolom kategori/tanggapan tidak ditemukan, pakai fallback!")
+        raise Exception("Struktur kolom CSV tidak cocok.")
     
 except Exception as e:
     pesan_error_asli = str(e)
@@ -72,6 +77,30 @@ KATEGORI_KDRT = {
 
 class ChatRequest(BaseModel):
     pesan_teks: str
+
+# ==========================================
+# FUNGSI PREPROCESSING (SINKRON DARI COLAB)
+# ==========================================
+def clean_text(text):
+    text = str(text).lower()
+    text = re.sub(r"http\S+|www\S+|https\S+", " ", text)
+    text = re.sub(r"[^a-zA-ZÀ-ÿáéíóúàèìòùâêîôûçñ\s]", " ", text)
+    
+    # NORMALISASI KATA (Perbaiki typo atau imbuhan yang salah)
+    kamus_perbaikan = {
+        "di ancam": "diancam",
+        "di pukul": "dipukul",
+        "di tampar": "ditampar",
+        "di cekik": "dicekik",
+        "di bunuh": "dibunuh",
+        "di tendang": "ditendang"
+    }
+    
+    for salah, benar in kamus_perbaikan.items():
+        text = text.replace(salah, benar)
+
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
 # ==========================================
 # ENDPOINT / ROUTES
@@ -105,54 +134,47 @@ def proses_klasifikasi(request: ChatRequest):
             "teks_laporan": teks_masuk,
             "kode_kategori": "SAPAAN",
             "hasil_klasifikasi": "Sapaan / Pesan Pendek",
-            "tingkat_keyakinan_ai": 100.0,
             "rekomendasi_sistem": "Halo! Selamat datang di SafeTalk AI DP3A Kabupaten Indramayu. Silakan ceritakan detail kejadian atau keluhan yang Anda alami, kami siap membantu dan melindungi Anda."
         }
 
     try:
         # ==================================================
-        # 2. FILTER KATA ASING (Out-Of-Vocabulary)
+        # 2. PREPROCESSING
         # ==================================================
-        tfidf_step = rf_model.named_steps['tfidf']
-        vektor_teks = tfidf_step.transform([teks_masuk])
-        probabilitas_max = 0.0
-        
-        # Kalau teksnya nggak dikenali sama sekali sama mesin TF-IDF
-        if vektor_teks.nnz == 0:
-            kode_kategori = "NON_KDRT"
-        else:
-            # ==================================================
-            # 3. FILTER PROBABILITAS
-            # ==================================================
-            probabilitas = rf_model.predict_proba([teks_masuk])[0]
-            probabilitas_max = max(probabilitas)
-            
-            # Kalau mesin gak yakin (di bawah 40%)
-            if probabilitas_max < 0.40: 
-                kode_kategori = "NON_KDRT"
-            else:
-                # ==================================================
-                # 4. PREDIKSI NORMAL RANDOM FOREST
-                # ==================================================
-                hasil_prediksi_mentah = rf_model.predict([teks_masuk])[0]
-                try:
-                    kode_kategori = label_encoder.inverse_transform([hasil_prediksi_mentah])[0]
-                except:
-                    kode_kategori = str(hasil_prediksi_mentah)
+        # Wajib di-clean dulu biar persis kayak data training di Colab
+        teks_bersih = clean_text(teks_masuk)
 
         # ==================================================
-        # 5. HASIL & REKOMENDASI SOP (Narik dari CSV)
+        # 3. PREDIKSI LANGSUNG DARI PIPELINE (KEMBAR DENGAN COLAB)
+        # ==================================================
+        # Catatan: rf_model ini sebenarnya adalah Pipeline (TF-IDF + Random Forest)
+        # Jadi kita tinggal masukkan teks string-nya saja, otomatis di-TF-IDF-kan oleh pipeline
+        
+        probabilitas = rf_model.predict_proba([teks_bersih])[0]
+        probabilitas_max = max(probabilitas)
+        
+        # Ambil prediksi mentah (angka)
+        hasil_prediksi_mentah = rf_model.predict([teks_bersih])[0]
+        
+        try:
+            # Ubah angka kembali jadi label ("K5", "NON_KDRT", dll)
+            kode_kategori = label_encoder.inverse_transform([hasil_prediksi_mentah])[0]
+        except:
+            kode_kategori = str(hasil_prediksi_mentah)
+
+        # ==================================================
+        # 4. HASIL & REKOMENDASI SOP (Narik dari CSV)
         # ==================================================
         hasil_deskripsi = KATEGORI_KDRT.get(kode_kategori, "Kategori Tidak Dikenali")
 
-        # Ini kuncinya bray! Narik balasan dari dictionary yang udah ngebaca dataset
+        # Narik balasan dari dictionary dataset
         rekomendasi = TANGGAPAN_KDRT.get(kode_kategori, "Sistem telah menerima pesan Anda. Kami akan segera merespon.")
 
         return {
-            "teks_laporan": teks_masuk,
+            "teks_laporan": teks_masuk,  
+            "teks_dianalisis": teks_bersih, 
             "kode_kategori": kode_kategori,
             "hasil_klasifikasi": hasil_deskripsi,
-            "tingkat_keyakinan_ai": round(probabilitas_max * 100, 2) if probabilitas_max > 0 else 100.0,
             "rekomendasi_sistem": rekomendasi
         }
 
